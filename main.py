@@ -280,9 +280,17 @@ def send_email(subject: str, html: str, plain: str):
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        result = json.loads(resp.read().decode())
-    print(f"✓ Email sent to {TO_EMAIL} (id: {result.get('id', '?')})")
+    print(f"  from:    {FROM_EMAIL}")
+    print(f"  to:      {TO_EMAIL}")
+    print(f"  api_key: {RESEND_API_KEY[:8]}...")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            result = json.loads(resp.read().decode())
+        print(f"✓ Email sent to {TO_EMAIL} (id: {result.get('id', '?')})")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        print(f"✗ Resend API error {e.code}: {body}")
+        raise
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
