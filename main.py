@@ -167,12 +167,15 @@ def build_html(word: str, wikt: dict, tatoeba: dict, level: str) -> str:
     # Example sentence block — only rendered if Tatoeba found something
     example_block = ""
     if tatoeba["turkish"]:
+        english_p = ""
+        if tatoeba["english"]:
+            english_p = '<p style="margin:10px 0 0;font-size:14px;color:#6b7280;line-height:1.7;font-family:Arial,sans-serif;">&ldquo;' + tatoeba["english"] + '&rdquo;</p>'
         example_block = f"""
     <tr>
       <td style="padding:28px 36px 0;">
         <p style="margin:0 0 10px;color:#a78bfa;font-size:11px;letter-spacing:1.5px;text-transform:uppercase;font-family:Arial,sans-serif;">In Use</p>
         <p style="margin:0;font-size:16px;color:#1a1a2e;line-height:1.8;font-style:italic;">"{tatoeba['turkish']}"</p>
-        {"<p style=\\"margin:10px 0 0;font-size:14px;color:#6b7280;line-height:1.7;font-family:Arial,sans-serif;\\">&ldquo;" + tatoeba['english'] + "&rdquo;</p>" if tatoeba['english'] else ""}
+        {english_p}
         <p style="margin:8px 0 0;color:#9ca3af;font-size:12px;font-family:Arial,sans-serif;">— Tatoeba</p>
       </td>
     </tr>"""
