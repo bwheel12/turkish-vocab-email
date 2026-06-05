@@ -39,29 +39,14 @@ def pick_word(words: list[str]) -> str:
 def fetch_wiktionary(word: str) -> dict:
     """
     Fetch definition, etymology, and page URL from English Wiktionary.
-    Uses the REST summary API plus the wikitext API for etymology extraction.
+    Uses the wikitext API to extract definitions and etymology from the Turkish section.
     Returns a dict with keys: definition, etymology, page_url.
     All values may be empty strings if not found.
     """
     encoded = urllib.parse.quote(word)
     result = {"definition": "", "etymology": "", "page_url": ""}
+    result["page_url"] = f"https://en.wiktionary.org/wiki/{encoded}"
 
-    # --- Summary (definition) ---
-    summary_url = f"https://en.wiktionary.org/api/rest_v1/page/summary/{encoded}"
-    try:
-        req = urllib.request.Request(
-            summary_url, headers={"User-Agent": "TurkishVocabBot/1.0"}
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
-            result["definition"] = data.get("extract", "")
-            result["page_url"] = (
-                data.get("content_urls", {}).get("desktop", {}).get("page", "")
-            )
-    except Exception:
-        pass
-
-    # --- Wikitext (etymology) ---
     wikitext_url = (
         f"https://en.wiktionary.org/w/api.php?action=parse&page={encoded}"
         f"&prop=wikitext&format=json"
@@ -74,25 +59,72 @@ def fetch_wiktionary(word: str) -> dict:
             data = json.loads(resp.read().decode())
         wikitext = data.get("parse", {}).get("wikitext", {}).get("*", "")
 
-        # Find the Turkish section, then look for an Etymology subsection
+        # Find the Turkish section
         turkish_match = re.search(
             r"==Turkish==(.+?)(?=\n==[^=]|\Z)", wikitext, re.DOTALL
         )
-        if turkish_match:
-            turkish_section = turkish_match.group(1)
-            etym_match = re.search(
-                r"===Etymology.*?===\s*(.+?)(?=\n===|\Z)", turkish_section, re.DOTALL
-            )
-            if etym_match:
-                raw = etym_match.group(1).strip()
-                # Strip wikitext markup: {{...}}, [[...]], ''...''
-                raw = re.sub(r"\{\{[^}]*\}\}", "", raw)
-                raw = re.sub(r"\[\[(?:[^|\]]*\|)?([^\]]+)\]\]", r"\1", raw)
-                raw = re.sub(r"'{2,3}", "", raw)
-                raw = re.sub(r"<[^>]+>", "", raw)
-                raw = re.sub(r"\s+", " ", raw).strip()
-                if raw:
-                    result["etymology"] = raw
+        if not turkish_match:
+            return result
+        turkish_section = turkish_match.group(1)
+
+        # --- Etymology ---
+        etym_match = re.search(
+            r"===Etymology[^=]*===\s*\n(.+?)(?=\n===|\Z)", turkish_section, re.DOTALL
+        )
+        if etym_match:
+            raw = etym_match.group(1).strip()
+            # Expand [[link|display]] → display, [[link]] → link
+            raw = re.sub(r"\[\[(?:[^|\]]*\|)?([^\]]+)\]\]", r"\1", raw)
+            # Expand {{affix|tr|base|-suffix}} and similar morphology templates
+            def expand_template(m):
+                parts = [p.strip() for p in m.group(1).split("|")]
+                name = parts[0].lower()
+                # Strip language codes and template names, keep word parts
+                words = [p for p in parts[1:] if p and not re.match(r'^[a-z]{2,3}$', p) and '=' not in p]
+                if name in ("affix", "suffix", "prefix", "confix", "compound"):
+                    return " + ".join(words)
+                if name in ("der", "inh", "bor", "inherited", "derived", "borrowed"):
+                    return words[-1] if words else ""
+                if name in ("m", "mention", "l", "link"):
+                    return words[-1] if words else ""
+                if name == "surf" or name == "surface analysis":
+                    return "surface analysis: " + " + ".join(words)
+                # Generic: just join remaining non-empty parts
+                return " ".join(words) if words else ""
+            raw = re.sub(r"\{\{([^}]+)\}\}", expand_template, raw)
+            raw = re.sub(r"'{2,3}", "", raw)
+            raw = re.sub(r"<[^>]+>", "", raw)
+            raw = re.sub(r"\s+", " ", raw).strip()
+            # Only keep if it's a meaningful string (not just punctuation/whitespace)
+            if raw and len(raw) > 3 and not re.match(r'^[\s.,:;+]+$', raw):
+                result["etymology"] = raw
+
+        # --- Definitions ---
+        # Find all POS sections (Noun, Verb, Adjective, etc.) and extract # definitions
+        definitions = []
+        pos_sections = re.findall(
+            r"===(Noun|Verb|Adjective|Adverb|Pronoun|Interjection|Participle|Postposition)[^=]*===\s*\n"
+            r"(?:[^#\n][^\n]*\n)*"  # optional header lines (head templates etc.)
+            r"((?:#[^:\n][^\n]*\n?)+)",  # definition lines starting with #
+            turkish_section
+        )
+        for pos, def_block in pos_sections:
+            for line in def_block.splitlines():
+                line = line.strip()
+                if not line.startswith("#") or line.startswith("#:") or line.startswith("#*"):
+                    continue
+                defn = line.lstrip("#").strip()
+                # Strip wikitext
+                defn = re.sub(r"\[\[(?:[^|\]]*\|)?([^\]]+)\]\]", r"\1", defn)
+                defn = re.sub(r"\{\{[^}]*\}\}", "", defn)
+                defn = re.sub(r"'{2,3}", "", defn)
+                defn = re.sub(r"<[^>]+>", "", defn)
+                defn = re.sub(r"\s+", " ", defn).strip()
+                if defn and len(defn) > 2:
+                    definitions.append(f"({pos.lower()}) {defn}")
+        if definitions:
+            result["definition"] = "; ".join(definitions[:3])  # cap at 3
+
     except Exception:
         pass
 
@@ -145,10 +177,19 @@ def build_html(word: str, wikt: dict, tatoeba: dict, level: str) -> str:
         else ""
     )
 
-    # Etymology block — only rendered if we have content
+    # Definition block — only rendered if we have a definition
+    definition_block = ""
+    if wikt["definition"]:
+        definition_block = f"""<tr>
+      <td style="padding:24px 36px 0;">
+        <p style="margin:0 0 4px;color:#a78bfa;font-size:11px;letter-spacing:1.5px;text-transform:uppercase;font-family:Arial,sans-serif;">Definition</p>
+        <p style="margin:0;font-size:17px;color:#1a1a2e;line-height:1.6;">{wikt["definition"]}</p>
+      </td>
+    </tr>"""
+
+    # Etymology block — only rendered if we have meaningful etymology
     etymology_block = ""
-    if wikt["etymology"] or wikt["definition"]:
-        etym_text = wikt["etymology"] or wikt["definition"]
+    if wikt["etymology"] and len(wikt["etymology"]) > 5:
         etymology_block = f"""
     <tr>
       <td style="padding:28px 36px 0;">
@@ -156,12 +197,18 @@ def build_html(word: str, wikt: dict, tatoeba: dict, level: str) -> str:
           <tr>
             <td style="background:#f8f7ff;border-left:3px solid #a78bfa;padding:16px 20px;border-radius:0 6px 6px 0;">
               <p style="margin:0 0 6px;color:#a78bfa;font-size:11px;letter-spacing:1.5px;text-transform:uppercase;font-family:Arial,sans-serif;">Word Origin</p>
-              <p style="margin:0;font-size:14px;color:#374151;line-height:1.7;font-family:Arial,sans-serif;">{etym_text}</p>
+              <p style="margin:0;font-size:14px;color:#374151;line-height:1.7;font-family:Arial,sans-serif;">{wikt["etymology"]}</p>
               <p style="margin:10px 0 0;">{wikt_link}</p>
             </td>
           </tr>
         </table>
       </td>
+    </tr>"""
+    elif wikt_link:
+        # Show just the Wiktionary link if no etymology but we have a URL
+        etymology_block = f"""
+    <tr>
+      <td style="padding:16px 36px 0;text-align:right;">{wikt_link}</td>
     </tr>"""
 
     # Example sentence block — only rendered if Tatoeba found something
@@ -211,12 +258,7 @@ def build_html(word: str, wikt: dict, tatoeba: dict, level: str) -> str:
     <tr><td style="padding:20px 36px 0;"><hr style="border:none;border-top:1px solid #e5e7eb;"></td></tr>
 
     <!-- Definition -->
-    <tr>
-      <td style="padding:24px 36px 0;">
-        <p style="margin:0 0 4px;color:#a78bfa;font-size:11px;letter-spacing:1.5px;text-transform:uppercase;font-family:Arial,sans-serif;">Definition</p>
-        <p style="margin:0;font-size:17px;color:#1a1a2e;line-height:1.6;">{wikt["definition"] or "See Wiktionary for details."}</p>
-      </td>
-    </tr>
+    {definition_block}
 
     {etymology_block}
     {example_block}
