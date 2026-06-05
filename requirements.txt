@@ -1,0 +1,2 @@
+# No third-party dependencies required.
+# All libraries used (smtplib, urllib, json, re) are part of the Python standard library.
