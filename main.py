@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 Turkish Daily Vocabulary Email
-Sends a daily vocabulary email based on CEFR level using Gmail SMTP.
+Sends a daily email with 2 CEFR-leveled Turkish words.
 Definitions and etymology from Wiktionary; example sentences from Tatoeba.
-No AI API required.
+Tracks seen words to avoid repeats. No AI API required.
 """
 
 import json
@@ -17,32 +17,58 @@ from datetime import date
 
 
 # ── Configuration (set via environment variables) ────────────────────────────
-CEFR_LEVEL   = os.environ.get("CEFR_LEVEL", "C1")
+CEFR_LEVEL     = os.environ.get("CEFR_LEVEL", "C1")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
-FROM_EMAIL   = os.environ.get("FROM_EMAIL")   # e.g. vocab@yourdomain.com
-TO_EMAIL     = os.environ.get("TO_EMAIL")
+FROM_EMAIL     = os.environ.get("FROM_EMAIL")
+TO_EMAIL       = os.environ.get("TO_EMAIL")
 
 
 # ── Load word list ────────────────────────────────────────────────────────────
-def load_words(level: str) -> list[str]:
+def load_words(level: str) -> list:
     path = os.path.join(os.path.dirname(__file__), f"words_{level.lower()}.json")
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def pick_word(words: list[str]) -> str:
+# ── Duplicate tracking ────────────────────────────────────────────────────────
+def get_seen_path(level: str) -> str:
+    return os.path.join(os.path.dirname(__file__), f"seen_{level.lower()}.json")
+
+
+def load_seen(level: str) -> set:
+    path = get_seen_path(level)
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    return set()
+
+
+def save_seen(level: str, seen: set):
+    path = get_seen_path(level)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(sorted(seen), f, ensure_ascii=False, indent=2)
+
+
+def pick_words(words: list, level: str, count: int = 2) -> list:
+    seen = load_seen(level)
+    available = [w for w in words if w not in seen]
+
+    # If exhausted, reset and start fresh
+    if len(available) < count:
+        print(f"  -> Word list exhausted, resetting seen words for {level.upper()}")
+        seen = set()
+        available = list(words)
+
     rng = random.Random(date.today().isoformat())
-    return rng.choice(words)
+    chosen = rng.sample(available, min(count, len(available)))
+
+    seen.update(chosen)
+    save_seen(level, seen)
+    return chosen
 
 
 # ── Wiktionary ────────────────────────────────────────────────────────────────
 def fetch_wiktionary(word: str) -> dict:
-    """
-    Fetch definition, etymology, and page URL from English Wiktionary.
-    Uses the wikitext API to extract definitions and etymology from the Turkish section.
-    Returns a dict with keys: definition, etymology, page_url.
-    All values may be empty strings if not found.
-    """
     encoded = urllib.parse.quote(word)
     result = {"definition": "", "etymology": "", "page_url": ""}
     result["page_url"] = f"https://en.wiktionary.org/wiki/{encoded}"
@@ -59,7 +85,6 @@ def fetch_wiktionary(word: str) -> dict:
             data = json.loads(resp.read().decode())
         wikitext = data.get("parse", {}).get("wikitext", {}).get("*", "")
 
-        # Find the Turkish section
         turkish_match = re.search(
             r"==Turkish==(.+?)(?=\n==[^=]|\Z)", wikitext, re.DOTALL
         )
@@ -73,39 +98,35 @@ def fetch_wiktionary(word: str) -> dict:
         )
         if etym_match:
             raw = etym_match.group(1).strip()
-            # Expand [[link|display]] → display, [[link]] → link
             raw = re.sub(r"\[\[(?:[^|\]]*\|)?([^\]]+)\]\]", r"\1", raw)
-            # Expand {{affix|tr|base|-suffix}} and similar morphology templates
+
             def expand_template(m):
                 parts = [p.strip() for p in m.group(1).split("|")]
                 name = parts[0].lower()
-                # Strip language codes and template names, keep word parts
-                words = [p for p in parts[1:] if p and not re.match(r'^[a-z]{2,3}$', p) and '=' not in p]
+                words_inner = [p for p in parts[1:] if p and not re.match(r'^[a-z]{2,3}$', p) and '=' not in p]
                 if name in ("affix", "suffix", "prefix", "confix", "compound"):
-                    return " + ".join(words)
+                    return " + ".join(words_inner)
                 if name in ("der", "inh", "bor", "inherited", "derived", "borrowed"):
-                    return words[-1] if words else ""
+                    return words_inner[-1] if words_inner else ""
                 if name in ("m", "mention", "l", "link"):
-                    return words[-1] if words else ""
-                if name == "surf" or name == "surface analysis":
-                    return "surface analysis: " + " + ".join(words)
-                # Generic: just join remaining non-empty parts
-                return " ".join(words) if words else ""
+                    return words_inner[-1] if words_inner else ""
+                if name in ("surf", "surface analysis"):
+                    return "surface analysis: " + " + ".join(words_inner)
+                return " ".join(words_inner) if words_inner else ""
+
             raw = re.sub(r"\{\{([^}]+)\}\}", expand_template, raw)
             raw = re.sub(r"'{2,3}", "", raw)
             raw = re.sub(r"<[^>]+>", "", raw)
             raw = re.sub(r"\s+", " ", raw).strip()
-            # Only keep if it's a meaningful string (not just punctuation/whitespace)
             if raw and len(raw) > 3 and not re.match(r'^[\s.,:;+]+$', raw):
                 result["etymology"] = raw
 
         # --- Definitions ---
-        # Find all POS sections (Noun, Verb, Adjective, etc.) and extract # definitions
         definitions = []
         pos_sections = re.findall(
             r"===(Noun|Verb|Adjective|Adverb|Pronoun|Interjection|Participle|Postposition)[^=]*===\s*\n"
-            r"(?:[^#\n][^\n]*\n)*"  # optional header lines (head templates etc.)
-            r"((?:#[^:\n][^\n]*\n?)+)",  # definition lines starting with #
+            r"(?:[^#\n][^\n]*\n)*"
+            r"((?:#[^:\n][^\n]*\n?)+)",
             turkish_section
         )
         for pos, def_block in pos_sections:
@@ -114,7 +135,6 @@ def fetch_wiktionary(word: str) -> dict:
                 if not line.startswith("#") or line.startswith("#:") or line.startswith("#*"):
                     continue
                 defn = line.lstrip("#").strip()
-                # Strip wikitext
                 defn = re.sub(r"\[\[(?:[^|\]]*\|)?([^\]]+)\]\]", r"\1", defn)
                 defn = re.sub(r"\{\{[^}]*\}\}", "", defn)
                 defn = re.sub(r"'{2,3}", "", defn)
@@ -123,7 +143,7 @@ def fetch_wiktionary(word: str) -> dict:
                 if defn and len(defn) > 2:
                     definitions.append(f"({pos.lower()}) {defn}")
         if definitions:
-            result["definition"] = "; ".join(definitions[:3])  # cap at 3
+            result["definition"] = "; ".join(definitions[:3])
 
     except Exception:
         pass
@@ -133,10 +153,6 @@ def fetch_wiktionary(word: str) -> dict:
 
 # ── Tatoeba ───────────────────────────────────────────────────────────────────
 def fetch_tatoeba(word: str) -> dict:
-    """
-    Search Tatoeba for a Turkish sentence containing the word.
-    Returns dict with keys: turkish, english (both may be empty if not found).
-    """
     encoded = urllib.parse.quote(word)
     url = (
         f"https://tatoeba.org/en/api_v0/search"
@@ -149,157 +165,119 @@ def fetch_tatoeba(word: str) -> dict:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
 
-        results = data.get("results", [])
-        for item in results:
+        for item in data.get("results", []):
             turkish_text = item.get("text", "")
-            # Look for an English translation
             for translation_group in item.get("translations", []):
                 for t in translation_group:
                     if t.get("lang") == "eng":
-                        return {
-                            "turkish": turkish_text,
-                            "english": t.get("text", ""),
-                        }
+                        return {"turkish": turkish_text, "english": t.get("text", "")}
     except Exception:
         pass
 
     return {"turkish": "", "english": ""}
 
 
-# ── HTML email template ───────────────────────────────────────────────────────
-def build_html(word: str, wikt: dict, tatoeba: dict, level: str) -> str:
-    today = date.today().strftime("%B %d, %Y")
-
+# ── HTML helpers ──────────────────────────────────────────────────────────────
+def build_word_card(word: str, wikt: dict, tatoeba: dict) -> str:
     wikt_link = (
-        f'<a href="{wikt["page_url"]}" style="color:#6b7280;font-size:12px;">'
-        f"Wiktionary entry ↗</a>"
-        if wikt["page_url"]
-        else ""
+        '<a href="' + wikt["page_url"] + '" style="color:#6b7280;font-size:12px;">Wiktionary entry &#x2197;</a>'
+        if wikt["page_url"] else ""
     )
 
-    # Definition block — only rendered if we have a definition
     definition_block = ""
     if wikt["definition"]:
-        definition_block = f"""<tr>
-      <td style="padding:24px 36px 0;">
-        <p style="margin:0 0 4px;color:#a78bfa;font-size:11px;letter-spacing:1.5px;text-transform:uppercase;font-family:Arial,sans-serif;">Definition</p>
-        <p style="margin:0;font-size:17px;color:#1a1a2e;line-height:1.6;">{wikt["definition"]}</p>
-      </td>
-    </tr>"""
+        definition_block = (
+            '<tr><td style="padding:20px 36px 0;">'
+            '<p style="margin:0 0 4px;color:#a78bfa;font-size:11px;letter-spacing:1.5px;text-transform:uppercase;font-family:Arial,sans-serif;">Definition</p>'
+            '<p style="margin:0;font-size:17px;color:#1a1a2e;line-height:1.6;">' + wikt["definition"] + '</p>'
+            '</td></tr>'
+        )
 
-    # Etymology block — only rendered if we have meaningful etymology
     etymology_block = ""
     if wikt["etymology"] and len(wikt["etymology"]) > 5:
-        etymology_block = f"""
-    <tr>
-      <td style="padding:28px 36px 0;">
-        <table width="100%" cellpadding="0" cellspacing="0">
-          <tr>
-            <td style="background:#f8f7ff;border-left:3px solid #a78bfa;padding:16px 20px;border-radius:0 6px 6px 0;">
-              <p style="margin:0 0 6px;color:#a78bfa;font-size:11px;letter-spacing:1.5px;text-transform:uppercase;font-family:Arial,sans-serif;">Word Origin</p>
-              <p style="margin:0;font-size:14px;color:#374151;line-height:1.7;font-family:Arial,sans-serif;">{wikt["etymology"]}</p>
-              <p style="margin:10px 0 0;">{wikt_link}</p>
-            </td>
-          </tr>
-        </table>
-      </td>
-    </tr>"""
+        etymology_block = (
+            '<tr><td style="padding:20px 36px 0;">'
+            '<table width="100%" cellpadding="0" cellspacing="0"><tr>'
+            '<td style="background:#f8f7ff;border-left:3px solid #a78bfa;padding:16px 20px;border-radius:0 6px 6px 0;">'
+            '<p style="margin:0 0 6px;color:#a78bfa;font-size:11px;letter-spacing:1.5px;text-transform:uppercase;font-family:Arial,sans-serif;">Word Origin</p>'
+            '<p style="margin:0;font-size:14px;color:#374151;line-height:1.7;font-family:Arial,sans-serif;">' + wikt["etymology"] + '</p>'
+            '<p style="margin:10px 0 0;">' + wikt_link + '</p>'
+            '</td></tr></table>'
+            '</td></tr>'
+        )
     elif wikt_link:
-        # Show just the Wiktionary link if no etymology but we have a URL
-        etymology_block = f"""
-    <tr>
-      <td style="padding:16px 36px 0;text-align:right;">{wikt_link}</td>
-    </tr>"""
+        etymology_block = '<tr><td style="padding:12px 36px 0;text-align:right;">' + wikt_link + '</td></tr>'
 
-    # Example sentence block — only rendered if Tatoeba found something
     example_block = ""
     if tatoeba["turkish"]:
         english_p = ""
         if tatoeba["english"]:
             english_p = '<p style="margin:10px 0 0;font-size:14px;color:#6b7280;line-height:1.7;font-family:Arial,sans-serif;">&ldquo;' + tatoeba["english"] + '&rdquo;</p>'
-        example_block = f"""
-    <tr>
-      <td style="padding:28px 36px 0;">
-        <p style="margin:0 0 10px;color:#a78bfa;font-size:11px;letter-spacing:1.5px;text-transform:uppercase;font-family:Arial,sans-serif;">In Use</p>
-        <p style="margin:0;font-size:16px;color:#1a1a2e;line-height:1.8;font-style:italic;">"{tatoeba['turkish']}"</p>
-        {english_p}
-        <p style="margin:8px 0 0;color:#9ca3af;font-size:12px;font-family:Arial,sans-serif;">— Tatoeba</p>
-      </td>
-    </tr>"""
+        example_block = (
+            '<tr><td style="padding:20px 36px 0;">'
+            '<p style="margin:0 0 10px;color:#a78bfa;font-size:11px;letter-spacing:1.5px;text-transform:uppercase;font-family:Arial,sans-serif;">In Use</p>'
+            '<p style="margin:0;font-size:16px;color:#1a1a2e;line-height:1.8;font-style:italic;">&ldquo;' + tatoeba["turkish"] + '&rdquo;</p>'
+            + english_p +
+            '<p style="margin:8px 0 0;color:#9ca3af;font-size:12px;font-family:Arial,sans-serif;">&#8212; Tatoeba</p>'
+            '</td></tr>'
+        )
 
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Turkish Word of the Day</title>
-</head>
-<body style="margin:0;padding:0;background:#f5f5f0;font-family:Georgia,serif;">
-<table width="100%" cellpadding="0" cellspacing="0" style="background:#f5f5f0;padding:32px 16px;">
-  <tr><td align="center">
-  <table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#ffffff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
-
-    <!-- Header -->
-    <tr>
-      <td style="background:#1a1a2e;padding:28px 36px;">
-        <p style="margin:0;color:#a78bfa;font-size:12px;letter-spacing:2px;text-transform:uppercase;font-family:Arial,sans-serif;">Turkish · Word of the Day</p>
-        <p style="margin:6px 0 0;color:#e5e7eb;font-size:13px;font-family:Arial,sans-serif;">{today} &nbsp;·&nbsp; CEFR {level}</p>
-      </td>
-    </tr>
-
-    <!-- Word -->
-    <tr>
-      <td style="padding:36px 36px 0;">
-        <h1 style="margin:0;font-size:48px;color:#1a1a2e;font-weight:normal;letter-spacing:-1px;">{word}</h1>
-      </td>
-    </tr>
-
-    <!-- Divider -->
-    <tr><td style="padding:20px 36px 0;"><hr style="border:none;border-top:1px solid #e5e7eb;"></td></tr>
-
-    <!-- Definition -->
-    {definition_block}
-
-    {etymology_block}
-    {example_block}
-
-    <!-- Footer -->
-    <tr>
-      <td style="padding:36px 36px 32px;">
-        <hr style="border:none;border-top:1px solid #e5e7eb;margin-bottom:20px;">
-        <p style="margin:0;color:#9ca3af;font-size:12px;font-family:Arial,sans-serif;text-align:center;">
-          Turkish Vocabulary · CEFR {level} · Daily series
-        </p>
-      </td>
-    </tr>
-
-  </table>
-  </td></tr>
-</table>
-</body>
-</html>"""
+    return (
+        '<tr><td style="padding:28px 36px 0;">'
+        '<h2 style="margin:0;font-size:40px;color:#1a1a2e;font-weight:normal;letter-spacing:-1px;">' + word + '</h2>'
+        '</td></tr>'
+        + definition_block
+        + etymology_block
+        + example_block
+    )
 
 
-def build_plain(word: str, wikt: dict, tatoeba: dict, level: str) -> str:
+def build_html_multi(entries: list, level: str) -> str:
+    today = date.today().strftime("%B %d, %Y")
+    cards = '<tr><td style="padding:20px 36px 0;"><hr style="border:none;border-top:2px solid #e5e7eb;"></td></tr>'.join(
+        build_word_card(word, wikt, tatoeba) for word, wikt, tatoeba in entries
+    )
+    return (
+        '<!DOCTYPE html><html lang="en"><head>'
+        '<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<title>Turkish Words of the Day</title></head>'
+        '<body style="margin:0;padding:0;background:#f5f5f0;font-family:Georgia,serif;">'
+        '<table width="100%" cellpadding="0" cellspacing="0" style="background:#f5f5f0;padding:32px 16px;">'
+        '<tr><td align="center">'
+        '<table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#ffffff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">'
+        '<tr><td style="background:#1a1a2e;padding:28px 36px;">'
+        '<p style="margin:0;color:#a78bfa;font-size:12px;letter-spacing:2px;text-transform:uppercase;font-family:Arial,sans-serif;">Turkish &middot; Words of the Day</p>'
+        '<p style="margin:6px 0 0;color:#e5e7eb;font-size:13px;font-family:Arial,sans-serif;">' + today + ' &nbsp;&middot;&nbsp; CEFR ' + level + '</p>'
+        '</td></tr>'
+        + cards +
+        '<tr><td style="padding:36px 36px 32px;">'
+        '<hr style="border:none;border-top:1px solid #e5e7eb;margin-bottom:20px;">'
+        '<p style="margin:0;color:#9ca3af;font-size:12px;font-family:Arial,sans-serif;text-align:center;">Turkish Vocabulary &middot; CEFR ' + level + ' &middot; Daily series</p>'
+        '</td></tr>'
+        '</table></td></tr></table></body></html>'
+    )
+
+
+def build_plain_multi(entries: list, level: str) -> str:
     today = date.today().strftime("%B %d, %Y")
     lines = [
-        f"Turkish Word of the Day — {today} (CEFR {level})",
+        f"Turkish Words of the Day -- {today} (CEFR {level})",
         "=" * 50,
-        "",
-        word.upper(),
-        "",
     ]
-    if wikt["definition"]:
-        lines += ["DEFINITION", wikt["definition"], ""]
-    if wikt["etymology"]:
-        lines += ["WORD ORIGIN", wikt["etymology"], ""]
-    if tatoeba["turkish"]:
-        lines += ["IN USE", f'"{tatoeba["turkish"]}"']
-        if tatoeba["english"]:
-            lines.append(f'"{tatoeba["english"]}"')
-        lines += ["— Tatoeba", ""]
-    if wikt["page_url"]:
-        lines += [f"Wiktionary: {wikt['page_url']}"]
+    for word, wikt, tatoeba in entries:
+        lines += ["", word.upper(), ""]
+        if wikt["definition"]:
+            lines += ["DEFINITION", wikt["definition"], ""]
+        if wikt["etymology"]:
+            lines += ["WORD ORIGIN", wikt["etymology"], ""]
+        if tatoeba["turkish"]:
+            lines += ["IN USE", f'"{tatoeba["turkish"]}"']
+            if tatoeba["english"]:
+                lines.append(f'"{tatoeba["english"]}"')
+            lines += ["-- Tatoeba", ""]
+        if wikt["page_url"]:
+            lines.append(f"Wiktionary: {wikt['page_url']}")
+        lines.append("-" * 50)
     return "\n".join(lines)
 
 
@@ -329,10 +307,10 @@ def send_email(subject: str, html: str, plain: str):
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             result = json.loads(resp.read().decode())
-        print(f"✓ Email sent to {TO_EMAIL} (id: {result.get('id', '?')})")
+        print(f"OK Email sent to {TO_EMAIL} (id: {result.get('id', '?')})")
     except urllib.error.HTTPError as e:
         body = e.read().decode()
-        print(f"✗ Resend API error {e.code}: {body}")
+        print(f"FAIL Resend API error {e.code}: {body}")
         raise
 
 
@@ -343,25 +321,27 @@ def main():
             "Missing required env vars: RESEND_API_KEY, FROM_EMAIL, TO_EMAIL"
         )
 
-    print(f"→ Loading {CEFR_LEVEL} word list...")
+    print(f"Loading {CEFR_LEVEL} word list...")
     words = load_words(CEFR_LEVEL)
-    word  = pick_word(words)
-    print(f"→ Today's word: {word}")
+    chosen = pick_words(words, CEFR_LEVEL, count=2)
+    print(f"Today's words: {', '.join(chosen)}")
 
-    print("→ Fetching Wiktionary...")
-    wikt = fetch_wiktionary(word)
-    print(f"  definition: {'✓' if wikt['definition'] else '✗'}")
-    print(f"  etymology:  {'✓' if wikt['etymology'] else '✗'}")
+    entries = []
+    for word in chosen:
+        print(f"\nFetching data for: {word}")
+        wikt = fetch_wiktionary(word)
+        print(f"  definition: {'OK' if wikt['definition'] else 'MISS'}")
+        print(f"  etymology:  {'OK' if wikt['etymology'] else 'MISS'}")
+        tatoeba = fetch_tatoeba(word)
+        print(f"  sentence:   {'OK' if tatoeba['turkish'] else 'MISS (skipped)'}")
+        entries.append((word, wikt, tatoeba))
 
-    print("→ Fetching Tatoeba example...")
-    tatoeba = fetch_tatoeba(word)
-    print(f"  sentence:   {'✓' if tatoeba['turkish'] else '✗ (skipped)'}")
+    words_label = " & ".join(w for w, _, _ in entries)
+    subject = f"Turkish Words of the Day: {words_label} ({CEFR_LEVEL})"
+    html  = build_html_multi(entries, CEFR_LEVEL)
+    plain = build_plain_multi(entries, CEFR_LEVEL)
 
-    subject = f"🇹🇷 Turkish Word of the Day: {word} ({CEFR_LEVEL})"
-    html    = build_html(word, wikt, tatoeba, CEFR_LEVEL)
-    plain   = build_plain(word, wikt, tatoeba, CEFR_LEVEL)
-
-    print("→ Sending email...")
+    print("\nSending email...")
     send_email(subject, html, plain)
 
 
