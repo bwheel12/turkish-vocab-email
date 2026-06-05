@@ -10,20 +10,17 @@ import json
 import os
 import random
 import re
-import smtplib
 import urllib.request
 import urllib.parse
 import urllib.error
 from datetime import date
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 
 
 # ── Configuration (set via environment variables) ────────────────────────────
 CEFR_LEVEL   = os.environ.get("CEFR_LEVEL", "C1")
-GMAIL_USER   = os.environ.get("GMAIL_USER")
-GMAIL_APP_PW = os.environ.get("GMAIL_APP_PW")
-TO_EMAIL     = os.environ.get("TO_EMAIL", GMAIL_USER)
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
+FROM_EMAIL   = os.environ.get("FROM_EMAIL")   # e.g. vocab@yourdomain.com
+TO_EMAIL     = os.environ.get("TO_EMAIL")
 
 
 # ── Load word list ────────────────────────────────────────────────────────────
@@ -167,18 +164,15 @@ def build_html(word: str, wikt: dict, tatoeba: dict, level: str) -> str:
       </td>
     </tr>"""
 
-# Example sentence block — only rendered if Tatoeba found something
+    # Example sentence block — only rendered if Tatoeba found something
     example_block = ""
     if tatoeba["turkish"]:
-        english_p = ""
-        if tatoeba["english"]:
-            english_p = '<p style="margin:10px 0 0;font-size:14px;color:#6b7280;line-height:1.7;font-family:Arial,sans-serif;">&ldquo;' + tatoeba["english"] + '&rdquo;</p>'
         example_block = f"""
     <tr>
       <td style="padding:28px 36px 0;">
         <p style="margin:0 0 10px;color:#a78bfa;font-size:11px;letter-spacing:1.5px;text-transform:uppercase;font-family:Arial,sans-serif;">In Use</p>
         <p style="margin:0;font-size:16px;color:#1a1a2e;line-height:1.8;font-style:italic;">"{tatoeba['turkish']}"</p>
-        {english_p}
+        {"<p style=\\"margin:10px 0 0;font-size:14px;color:#6b7280;line-height:1.7;font-family:Arial,sans-serif;\\">&ldquo;" + tatoeba['english'] + "&rdquo;</p>" if tatoeba['english'] else ""}
         <p style="margin:8px 0 0;color:#9ca3af;font-size:12px;font-family:Arial,sans-serif;">— Tatoeba</p>
       </td>
     </tr>"""
@@ -266,24 +260,33 @@ def build_plain(word: str, wikt: dict, tatoeba: dict, level: str) -> str:
 
 # ── Send email ────────────────────────────────────────────────────────────────
 def send_email(subject: str, html: str, plain: str):
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"]    = GMAIL_USER
-    msg["To"]      = TO_EMAIL
-    msg.attach(MIMEText(plain, "plain", "utf-8"))
-    msg.attach(MIMEText(html,  "html",  "utf-8"))
+    payload = json.dumps({
+        "from": FROM_EMAIL,
+        "to": [TO_EMAIL],
+        "subject": subject,
+        "html": html,
+        "text": plain,
+    }).encode()
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(GMAIL_USER, GMAIL_APP_PW)
-        server.sendmail(GMAIL_USER, TO_EMAIL, msg.as_string())
-    print(f"✓ Email sent to {TO_EMAIL}")
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        result = json.loads(resp.read().decode())
+    print(f"✓ Email sent to {TO_EMAIL} (id: {result.get('id', '?')})")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    if not all([GMAIL_USER, GMAIL_APP_PW]):
+    if not all([RESEND_API_KEY, FROM_EMAIL, TO_EMAIL]):
         raise EnvironmentError(
-            "Missing required env vars: GMAIL_USER, GMAIL_APP_PW"
+            "Missing required env vars: RESEND_API_KEY, FROM_EMAIL, TO_EMAIL"
         )
 
     print(f"→ Loading {CEFR_LEVEL} word list...")

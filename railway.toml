@@ -1,5 +1,5 @@
 [deploy]
 # Runs every day at 7:00 AM UTC — adjust to your preferred time.
 # Railway cron syntax: minute hour day month weekday
-cronSchedule = "0 13 * * *"
+cronSchedule = "0 7 * * *"
 startCommand = "python main.py"
