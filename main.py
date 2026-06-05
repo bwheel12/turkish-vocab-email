@@ -277,6 +277,7 @@ def send_email(subject: str, html: str, plain: str):
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {RESEND_API_KEY}",
+            "User-Agent": "TurkishVocabBot/1.0",
         },
         method="POST",
     )
