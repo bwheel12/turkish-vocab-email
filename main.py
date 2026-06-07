@@ -151,30 +151,115 @@ def fetch_wiktionary(word: str) -> dict:
     return result
 
 
-# ── Tatoeba ───────────────────────────────────────────────────────────────────
-def fetch_tatoeba(word: str) -> dict:
+# ── Example sentence sources ──────────────────────────────────────────────────
+
+def fetch_tdk(word):
+    """TDK (Turk Dil Kurumu) official dictionary - has example sentences."""
     encoded = urllib.parse.quote(word)
-    url = (
-        f"https://tatoeba.org/en/api_v0/search"
-        f"?query={encoded}&from=tur&to=eng&trans_filter=limit&limit=10"
-    )
+    url = "https://sozluk.gov.tr/gts?ara=" + encoded
     try:
-        req = urllib.request.Request(
-            url, headers={"User-Agent": "TurkishVocabBot/1.0"}
-        )
+        req = urllib.request.Request(url, headers={"User-Agent": "TurkishVocabBot/1.0"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
+        if not isinstance(data, list) or not data:
+            return {}
+        for entry in data:
+            for anlam in entry.get("anlamlarListe", []):
+                for ornek in anlam.get("orneklerListe", []):
+                    sentence = ornek.get("ornek", "").strip()
+                    first = word.split()[0].lower()
+                    if sentence and first in sentence.lower():
+                        return {"turkish": sentence, "english": "", "source": "TDK"}
+    except Exception:
+        pass
+    return {}
 
+
+def fetch_turkish_wikipedia(word):
+    """Search Turkish Wikipedia for a sentence containing the word/phrase."""
+    encoded = urllib.parse.quote(word)
+    search_url = (
+        "https://tr.wikipedia.org/w/api.php?action=query&list=search"
+        "&srsearch=" + encoded + "&srlimit=3&format=json"
+    )
+    try:
+        req = urllib.request.Request(search_url, headers={"User-Agent": "TurkishVocabBot/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        hits = data.get("query", {}).get("search", [])
+        if not hits:
+            return {}
+        page_title = urllib.parse.quote(hits[0]["title"])
+        extract_url = (
+            "https://tr.wikipedia.org/w/api.php?action=query&titles=" + page_title
+            + "&prop=extracts&exintro=1&explaintext=1&format=json"
+        )
+        req2 = urllib.request.Request(extract_url, headers={"User-Agent": "TurkishVocabBot/1.0"})
+        with urllib.request.urlopen(req2, timeout=10) as resp2:
+            data2 = json.loads(resp2.read().decode())
+        pages = data2.get("query", {}).get("pages", {})
+        for page in pages.values():
+            extract = page.get("extract", "")
+            if not extract:
+                continue
+            sentences = re.split(r"(?<=[.!?]) +", extract)
+            first = word.split()[0].lower()
+            for sentence in sentences:
+                if first in sentence.lower() and len(sentence) > 30:
+                    sentence = sentence.strip()
+                    if len(sentence) > 300:
+                        sentence = sentence[:300].rsplit(" ", 1)[0] + "..."
+                    return {
+                        "turkish": sentence,
+                        "english": "",
+                        "source": "Vikipedi",
+                        "source_url": "https://tr.wikipedia.org/wiki/" + page_title
+                    }
+    except Exception:
+        pass
+    return {}
+
+
+def fetch_tatoeba(word):
+    encoded = urllib.parse.quote(word)
+    url = (
+        "https://tatoeba.org/en/api_v0/search"
+        "?query=" + encoded + "&from=tur&to=eng&trans_filter=limit&limit=10"
+    )
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "TurkishVocabBot/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
         for item in data.get("results", []):
             turkish_text = item.get("text", "")
             for translation_group in item.get("translations", []):
                 for t in translation_group:
                     if t.get("lang") == "eng":
-                        return {"turkish": turkish_text, "english": t.get("text", "")}
+                        return {
+                            "turkish": turkish_text,
+                            "english": t.get("text", ""),
+                            "source": "Tatoeba"
+                        }
     except Exception:
         pass
+    return {}
 
-    return {"turkish": "", "english": ""}
+
+def fetch_example(word):
+    """Chain: TDK -> Turkish Wikipedia -> Tatoeba -> empty."""
+    result = fetch_tdk(word)
+    if result.get("turkish"):
+        print("    source: TDK")
+        return result
+    result = fetch_turkish_wikipedia(word)
+    if result.get("turkish"):
+        print("    source: Vikipedi")
+        return result
+    result = fetch_tatoeba(word)
+    if result.get("turkish"):
+        print("    source: Tatoeba")
+        return result
+    return {"turkish": "", "english": "", "source": ""}
 
 
 # ── HTML helpers ──────────────────────────────────────────────────────────────
@@ -213,12 +298,18 @@ def build_word_card(word: str, wikt: dict, tatoeba: dict) -> str:
         english_p = ""
         if tatoeba["english"]:
             english_p = '<p style="margin:10px 0 0;font-size:14px;color:#6b7280;line-height:1.7;font-family:Arial,sans-serif;">&ldquo;' + tatoeba["english"] + '&rdquo;</p>'
+        source = tatoeba.get("source", "Tatoeba")
+        source_url = tatoeba.get("source_url", "")
+        if source_url:
+            source_label = '<a href="' + source_url + '" style="color:#9ca3af;text-decoration:none;">&#8212; ' + source + '</a>'
+        else:
+            source_label = "&#8212; " + source
         example_block = (
             '<tr><td style="padding:20px 36px 0;">'
             '<p style="margin:0 0 10px;color:#a78bfa;font-size:11px;letter-spacing:1.5px;text-transform:uppercase;font-family:Arial,sans-serif;">In Use</p>'
             '<p style="margin:0;font-size:16px;color:#1a1a2e;line-height:1.8;font-style:italic;">&ldquo;' + tatoeba["turkish"] + '&rdquo;</p>'
             + english_p +
-            '<p style="margin:8px 0 0;color:#9ca3af;font-size:12px;font-family:Arial,sans-serif;">&#8212; Tatoeba</p>'
+            '<p style="margin:8px 0 0;color:#9ca3af;font-size:12px;font-family:Arial,sans-serif;">' + source_label + '</p>'
             '</td></tr>'
         )
 
@@ -274,7 +365,9 @@ def build_plain_multi(entries: list, level: str) -> str:
             lines += ["IN USE", f'"{tatoeba["turkish"]}"']
             if tatoeba["english"]:
                 lines.append(f'"{tatoeba["english"]}"')
-            lines += ["-- Tatoeba", ""]
+            source = tatoeba.get("source", "")
+            if source:
+                lines += [f"-- {source}", ""]
         if wikt["page_url"]:
             lines.append(f"Wiktionary: {wikt['page_url']}")
         lines.append("-" * 50)
@@ -332,7 +425,7 @@ def main():
         wikt = fetch_wiktionary(word)
         print(f"  definition: {'OK' if wikt['definition'] else 'MISS'}")
         print(f"  etymology:  {'OK' if wikt['etymology'] else 'MISS'}")
-        tatoeba = fetch_tatoeba(word)
+        tatoeba = fetch_example(word)
         print(f"  sentence:   {'OK' if tatoeba['turkish'] else 'MISS (skipped)'}")
         entries.append((word, wikt, tatoeba))
 
